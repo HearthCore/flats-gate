@@ -19,3 +19,10 @@ Service: `systemctl status flats-gate` (system unit), config `/root/flats-gate/.
 Rotate key: edit `FLATS_GATE_API_KEYS` (comma separated, one per client), `systemctl restart flats-gate`.
 Hermes MCP: `mcp_servers.flats` = stdio `/root/.local/bin/flats mcp` (loopback, no key needed).
 Skill: `~/.hermes/skills/devops/flats-deploy/SKILL.md` (refresh: `flats skill sync --output <path>`).
+
+## Public agent docs (no key)
+`FLATS_GATE_PUBLIC_DOCS=true` (default) lets the MCP gate serve exactly five static GET paths from Flats' own binary:
+`/llms.txt`, `/llms-full.txt`, `/docs/agent-guide.md`, `/docs/runtime-api-v1.md`, `/docs/content-types.md`.
+Loopback URLs are rewritten to `FLATS_GATE_CONSOLE_PUBLIC_URL`; `/llms*.txt` get an "Access" section (API key hint).
+There is no `/docs` tree - every other `/docs/...` path is 404. Pangolin: bypass-auth rules for `/llms.txt`,
+`/llms-full.txt`, `/docs/*`; targets (prefix `/llms` and `/docs`) -> 127.0.0.1:7881.

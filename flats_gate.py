@@ -171,7 +171,40 @@ def rewrite_mcp_body(body: bytes) -> bytes:
     return body.replace(UPSTREAM.encode(), CONSOLE_PUBLIC_URL.encode())
 
 
+# Static, host-independent agent docs that Flats serves from its own binary
+# (mcpx.LLMsPaths). Exact paths only - there is no /docs tree.
+DOC_PATHS = {"/llms.txt", "/llms-full.txt", "/docs/agent-guide.md",
+             "/docs/runtime-api-v1.md", "/docs/content-types.md"}
+PUBLIC_DOCS = env("FLATS_GATE_PUBLIC_DOCS", "true").lower() in ("1", "true", "yes")
+
+ACCESS_NOTE = (
+    "## Access\n\n"
+    "This host's MCP endpoint requires an API key. Send `Authorization: Bearer <key>` "
+    "(or `X-API-Key: <key>`); without it the endpoint answers 401. Claude Code: "
+    "`claude mcp add --transport http flats {url}/mcp --header \"Authorization: Bearer <key>\"`. "
+    "Approvals are decided by the operator in the web console ({url}), which sits behind SSO; "
+    "agents cannot approve.\n\n"
+)
+
+
+def rewrite_docs_body(path: str):
+    def fn(body: bytes) -> bytes:
+        body = body.replace(UPSTREAM.encode(), CONSOLE_PUBLIC_URL.encode())
+        if path in ("/llms.txt", "/llms-full.txt"):
+            note = ACCESS_NOTE.format(url=CONSOLE_PUBLIC_URL).encode()
+            body = body.replace(b"\n## Docs\n", b"\n" + note + b"## Docs\n", 1)
+        return body
+    return fn
+
+
 async def mcp_handler(request: web.Request):
+    if PUBLIC_DOCS and request.path in DOC_PATHS:
+        if request.method not in ("GET", "HEAD"):
+            return web.json_response({"error": "method not allowed"}, status=405,
+                                     headers={"Allow": "GET, HEAD"})
+        headers = {k: v for k, v in clean_headers(request.headers).items()
+                   if k.lower() in ("accept", "user-agent")} | {"Host": UP_HOSTPORT}
+        return await forward(request, headers, rewrite_body=rewrite_docs_body(request.path))
     if request.path != "/mcp":
         return web.json_response({"error": "not found"}, status=404)
     if not key_ok(request):
