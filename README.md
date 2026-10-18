@@ -19,7 +19,7 @@ DNS-rebinding protection stays meaningful. MCP gate: loopback URLs inside respon
 only possible through the console gate, never through MCP.
 
 This is a **workaround shim**, not a feature: it is the reference implementation for the
-external-console-hostname request filed upstream in gosuda/flats. If an upstream release lets the
+external-console-hostname request in gosuda/flats [#137](https://github.com/gosuda/flats/issues/137). If an upstream release lets the
 operator declare external console hostnames, retire this.
 
 ## Setup
