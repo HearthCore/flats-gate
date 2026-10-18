@@ -1,0 +1,18 @@
+[Unit]
+Description=Flats gate (Host/Origin rewrite + MCP API key in front of Flats)
+After=network.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/flats-gate
+EnvironmentFile=/opt/flats-gate/.env
+ExecStart=/opt/flats-gate/venv/bin/python /opt/flats-gate/flats_gate.py
+Restart=on-failure
+RestartSec=3
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=read-only
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target
