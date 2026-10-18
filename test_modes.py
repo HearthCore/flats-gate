@@ -49,6 +49,9 @@ check("A access note present (keys configured)", "## Access" in b)
 s, _ = req("http://127.0.0.1:7880/", host="flats.goetzken.dev")
 check("A console public host ok", s == 200, s)
 
+s, b = req("http://127.0.0.1:7880/llms.txt", host="flats.goetzken.dev")
+check("A docs also rewritten via console gate", s == 200 and "https://flats.goetzken.dev/mcp" in b and "127.0.0.1" not in b)
+
 print("== B: no public URL (local-only mode, no key)")
 p = spawn({"FLATS_GATE_CONSOLE_PUBLIC_URL": "", "FLATS_GATE_API_KEYS": ""})
 s, _ = req(M + "/llms.txt")

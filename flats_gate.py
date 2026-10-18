@@ -151,6 +151,10 @@ async def console_handler(request: web.Request):
         return web.json_response({"error": "MCP is served on the keyed MCP endpoint only"}, status=404)
     headers = clean_headers(request.headers)
     headers["Host"] = UP_HOSTPORT
+    if CONSOLE_PUBLIC_URL and request.path in DOC_PATHS and request.method in ("GET", "HEAD"):
+        # same agent docs as on the mcp gate: reached via the console target too, so rewrite here as well
+        return await forward(request, {k: v for k, v in headers.items() if k.lower() in ("accept", "user-agent", "host")},
+                             rewrite_body=rewrite_docs_body(request.path))
     origin = request.headers.get("Origin")
     if origin is not None:
         if origin.lower() not in CONSOLE_ORIGINS:
