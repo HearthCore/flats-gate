@@ -63,15 +63,17 @@ UP_HOSTPORT = urlsplit(UPSTREAM).netloc
 BIND = env("FLATS_GATE_BIND", "127.0.0.1")
 CONSOLE_PORT = int(env("FLATS_GATE_CONSOLE_PORT", "7880"))
 MCP_PORT = int(env("FLATS_GATE_MCP_PORT", "7881"))
-CONSOLE_PUBLIC_URL = env("FLATS_GATE_CONSOLE_PUBLIC_URL", "https://flats.goetzken.dev").rstrip("/")
+CONSOLE_PUBLIC_URL = env("FLATS_GATE_CONSOLE_PUBLIC_URL", "").rstrip("/")  # empty = no public mode
 MCP_PUBLIC_URL = env("FLATS_GATE_MCP_PUBLIC_URL", "").rstrip("/")  # optional, for mcp_url rewrite
 API_KEYS = [k for k in (s.strip() for s in env("FLATS_GATE_API_KEYS").split(",")) if k]
 MIN_KEY_LEN = 24
 
 _pub = urlsplit(CONSOLE_PUBLIC_URL)
-# Host names the console gate accepts. Pangolin forwards the public Host.
+if CONSOLE_PUBLIC_URL and (_pub.scheme not in ("http", "https") or not _pub.netloc):
+    sys.exit(f"flats-gate: FLATS_GATE_CONSOLE_PUBLIC_URL must be http(s)://host[:port], got {CONSOLE_PUBLIC_URL!r}")
+# Host names the console gate accepts. With a public URL set, Pangolin's public Host is added.
 CONSOLE_HOSTS = {h.lower() for h in (
-    [_pub.netloc] + [f"127.0.0.1:{CONSOLE_PORT}", f"localhost:{CONSOLE_PORT}"]
+    ([_pub.netloc] if CONSOLE_PUBLIC_URL else []) + [f"127.0.0.1:{CONSOLE_PORT}", f"localhost:{CONSOLE_PORT}"]
     + [s.strip() for s in env("FLATS_GATE_EXTRA_HOSTS").split(",") if s.strip()]
 )}
 CONSOLE_ORIGINS = set()
@@ -136,7 +138,7 @@ async def forward(request: web.Request, headers: dict, rewrite_body=None, rewrit
 
 # ---------------------------------------------------------------- console gate
 def console_location(v: str) -> str:
-    if v.startswith(UPSTREAM):
+    if CONSOLE_PUBLIC_URL and v.startswith(UPSTREAM):
         return CONSOLE_PUBLIC_URL + v[len(UPSTREAM):]
     return v
 
@@ -168,14 +170,18 @@ async def console_handler(request: web.Request):
 def rewrite_mcp_body(body: bytes) -> bytes:
     if MCP_PUBLIC_URL:
         body = body.replace((UPSTREAM + "/mcp").encode(), (MCP_PUBLIC_URL + "/mcp").encode())
-    return body.replace(UPSTREAM.encode(), CONSOLE_PUBLIC_URL.encode())
+    if CONSOLE_PUBLIC_URL:
+        body = body.replace(UPSTREAM.encode(), CONSOLE_PUBLIC_URL.encode())
+    return body
 
 
 # Static, host-independent agent docs that Flats serves from its own binary
 # (mcpx.LLMsPaths). Exact paths only - there is no /docs tree.
 DOC_PATHS = {"/llms.txt", "/llms-full.txt", "/docs/agent-guide.md",
              "/docs/runtime-api-v1.md", "/docs/content-types.md"}
-PUBLIC_DOCS = env("FLATS_GATE_PUBLIC_DOCS", "true").lower() in ("1", "true", "yes")
+# auto (default): on exactly when a public URL is configured; true/false force it.
+_docs = env("FLATS_GATE_PUBLIC_DOCS", "auto").lower()
+PUBLIC_DOCS = bool(CONSOLE_PUBLIC_URL) if _docs == "auto" else _docs in ("1", "true", "yes")
 
 ACCESS_NOTE = (
     "## Access\n\n"
@@ -189,8 +195,10 @@ ACCESS_NOTE = (
 
 def rewrite_docs_body(path: str):
     def fn(body: bytes) -> bytes:
-        body = body.replace(UPSTREAM.encode(), CONSOLE_PUBLIC_URL.encode())
-        if path in ("/llms.txt", "/llms-full.txt"):
+        if CONSOLE_PUBLIC_URL:
+            body = body.replace(UPSTREAM.encode(), CONSOLE_PUBLIC_URL.encode())
+        # only advertise a key requirement that is actually enforced, and only with a URL to show
+        if CONSOLE_PUBLIC_URL and API_KEYS and path in ("/llms.txt", "/llms-full.txt"):
             note = ACCESS_NOTE.format(url=CONSOLE_PUBLIC_URL).encode()
             body = body.replace(b"\n## Docs\n", b"\n" + note + b"## Docs\n", 1)
         return body
@@ -253,8 +261,8 @@ async def main():
         await r.setup()
         await web.TCPSite(r, BIND, port).start()
         runners.append(r)
-    log.info("console gate %s:%s (public %s) | mcp gate %s:%s (keys=%d) -> %s",
-             BIND, CONSOLE_PORT, CONSOLE_PUBLIC_URL, BIND, MCP_PORT, len(API_KEYS), UPSTREAM)
+    log.info("console gate %s:%s (public=%s) | mcp gate %s:%s (keys=%d, public_docs=%s) -> %s",
+             BIND, CONSOLE_PORT, CONSOLE_PUBLIC_URL or "off", BIND, MCP_PORT, len(API_KEYS), PUBLIC_DOCS, UPSTREAM)
     await asyncio.Event().wait()
 
 

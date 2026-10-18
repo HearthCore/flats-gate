@@ -21,8 +21,13 @@ Hermes MCP: `mcp_servers.flats` = stdio `/root/.local/bin/flats mcp` (loopback, 
 Skill: `~/.hermes/skills/devops/flats-deploy/SKILL.md` (refresh: `flats skill sync --output <path>`).
 
 ## Public agent docs (no key)
-`FLATS_GATE_PUBLIC_DOCS=true` (default) lets the MCP gate serve exactly five static GET paths from Flats' own binary:
+`FLATS_GATE_PUBLIC_DOCS` (`auto` default = on exactly when `FLATS_GATE_CONSOLE_PUBLIC_URL` is set; `true`/`false` force) lets the MCP gate serve exactly five static GET paths from Flats' own binary:
 `/llms.txt`, `/llms-full.txt`, `/docs/agent-guide.md`, `/docs/runtime-api-v1.md`, `/docs/content-types.md`.
 Loopback URLs are rewritten to `FLATS_GATE_CONSOLE_PUBLIC_URL`; `/llms*.txt` get an "Access" section (API key hint).
 There is no `/docs` tree - every other `/docs/...` path is 404. Pangolin: bypass-auth rules for `/llms.txt`,
 `/llms-full.txt`, `/docs/*`; targets (prefix `/llms` and `/docs`) -> 127.0.0.1:7881.
+
+## Public mode is optional
+`FLATS_GATE_CONSOLE_PUBLIC_URL` empty = local-only mode: only loopback Host names accepted, no URL rewriting,
+no public docs, no access note. Set it (e.g. `https://flats.goetzken.dev`) to enable public mode. The "Access" note in
+llms.txt is only added when API keys are configured. Mode tests: `python3 test_modes.py` (spawns throw-away instances on :17880/:17881).
