@@ -33,6 +33,8 @@ from urllib.parse import urlsplit
 import aiohttp
 from aiohttp import web
 
+from flats_site_gate import SUFFIX as SITE_SUFFIX, POLICY as SITE_POLICY, make_site_handler
+
 log = logging.getLogger("flats-gate")
 
 HOP = {
@@ -56,6 +58,7 @@ UP_HOSTPORT = urlsplit(UPSTREAM).netloc
 BIND = env("FLATS_GATE_BIND", "127.0.0.1")
 CONSOLE_PORT = int(env("FLATS_GATE_CONSOLE_PORT", "7880"))
 MCP_PORT = int(env("FLATS_GATE_MCP_PORT", "7881"))
+SITE_PORT = int(env("FLATS_GATE_SITE_PORT", "7882"))
 CONSOLE_PUBLIC_URL = env("FLATS_GATE_CONSOLE_PUBLIC_URL", "").rstrip("/")  # empty = local-only mode
 MCP_PUBLIC_URL = env("FLATS_GATE_MCP_PUBLIC_URL", "").rstrip("/")
 API_KEYS = [k for k in (s.strip() for s in env("FLATS_GATE_API_KEYS").split(",")) if k]
@@ -268,7 +271,10 @@ async def main():
     if API_KEYS and min(len(k) for k in API_KEYS) < MIN_KEY_LEN:
         sys.exit(f"flats-gate: refusing keys shorter than {MIN_KEY_LEN} chars")
     runners = []
-    for app, port in ((make_app(console_handler), CONSOLE_PORT), (make_app(mcp_handler), MCP_PORT)):
+    gates = [(make_app(console_handler), CONSOLE_PORT), (make_app(mcp_handler), MCP_PORT)]
+    if SITE_SUFFIX:  # site gate only when a public suffix is configured
+        gates.append((make_app(make_site_handler()), SITE_PORT))
+    for app, port in gates:
         r = web.AppRunner(app, access_log=None)
         await r.setup()
         await web.TCPSite(r, BIND, port).start()
@@ -276,6 +282,8 @@ async def main():
     log.info("console gate %s:%s (public=%s, metrics_blocked=%s) | mcp gate %s:%s (keys=%d, public_docs=%s) -> %s",
              BIND, CONSOLE_PORT, CONSOLE_PUBLIC_URL or "off", BLOCK_METRICS,
              BIND, MCP_PORT, len(API_KEYS), PUBLIC_DOCS, UPSTREAM)
+    if SITE_SUFFIX:
+        log.info("site gate %s:%s (*.%s, policy=%s)", BIND, SITE_PORT, SITE_SUFFIX, SITE_POLICY)
     await asyncio.Event().wait()
 
 
