@@ -55,6 +55,21 @@ Set it offline with the Flats host stopped:
 flats config set console.external_origins 'https://flats.example.org'
 ```
 
+## Site gate: `*.flats` wildcard (optional)
+
+Flat sites are served by Flats on a separate loopback listener (`127.0.0.1:7879`) and only for the
+host form `<slug>.localhost`. A reverse proxy that forwards `<slug>.flats.example.org` therefore gets a 404.
+Set `FLATS_GATE_SITE_PUBLIC_SUFFIX=flats.example.org` and the gate opens a third listener (`:7882`) that
+maps `<slug>.<suffix>` back to `<slug>.localhost`. Point a wildcard route at it.
+
+- **Policy** (`FLATS_GATE_SITE_POLICY`): `public` (default, only flats with visibility=public, read live
+  from the Flats API), `allowlist` (slugs in `FLATS_GATE_SITE_ALLOWLIST`), `all` (every flat, private
+  ones included: only use it with authentication in front of the wildcard route).
+- **Links**: Flats reports flat links as `http://<slug>.localhost:7879`. With a suffix set, the gate
+  rewrites them to `https://<slug>.<suffix>` in console API JSON and MCP answers (HTML/JS are untouched).
+- **Proxy side**: needs a wildcard certificate (DNS-01) and a wildcard route to `127.0.0.1:7882`.
+- Off unless the suffix is set. Tests: mode F in `test_modes.py`.
+
 ## Public agent docs (no key)
 
 `FLATS_GATE_PUBLIC_DOCS` (`auto` = on exactly when `FLATS_GATE_CONSOLE_PUBLIC_URL` is set;

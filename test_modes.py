@@ -46,7 +46,7 @@ def check(name, cond, extra=""):
 
 def spawn(extra_env):
     env = {k: v for k, v in os.environ.items() if not k.startswith("FLATS_GATE_")}
-    env.update({"FLATS_GATE_CONSOLE_PORT": "17880", "FLATS_GATE_MCP_PORT": "17881"})
+    env.update({"FLATS_GATE_CONSOLE_PORT": "17880", "FLATS_GATE_MCP_PORT": "17881", "FLATS_GATE_SITE_PORT": "17882"})
     env.update(extra_env)
     p = subprocess.Popen([sys.executable, os.path.join(HERE, "flats_gate.py")], env=env,
                          stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
@@ -131,6 +131,39 @@ r = subprocess.run([sys.executable, os.path.join(HERE, "flats_gate.py")], captur
                    env={**os.environ, "FLATS_GATE_CONSOLE_PUBLIC_URL": "flats.example.org",
                         "FLATS_GATE_CONSOLE_PORT": "17880", "FLATS_GATE_MCP_PORT": "17881"})
 check("E invalid URL aborts start", r.returncode != 0 and "must be http(s)" in (r.stdout + r.stderr))
+
+print("== F: site gate (*.suffix -> <slug>.localhost)")
+slug = None
+try:
+    import json as _json
+    with urllib.request.urlopen("http://127.0.0.1:7878/api/flats", timeout=10) as _r:
+        _flats = _json.load(_r).get("flats") or []
+    slug = _flats[0]["slug"] if _flats else None
+except Exception:
+    pass
+SUF = "flats.example.org"
+if not slug:
+    print("SKIP mode F: no flat on the local Flats host")
+else:
+    p = spawn({"FLATS_GATE_SITE_PUBLIC_SUFFIX": SUF, "FLATS_GATE_SITE_POLICY": "all", "FLATS_GATE_API_KEYS": KEY})
+    S = "http://127.0.0.1:17882"
+    s, _ = req(S + "/", host=f"{slug}.{SUF}")
+    check("F policy=all serves an existing flat", s == 200, s)
+    s, _ = req(S + "/", host=f"nope-{slug}.{SUF}")
+    check("F unknown flat answers 404", s == 404, s)
+    s, _ = req(S + "/", host="evil.example.org")
+    check("F foreign host refused", s == 404, s)
+    s, _ = req(S + "/", host=SUF)
+    check("F apex refused", s == 404, s)
+    s, _ = req(S + "/", host=f"a.{slug}.{SUF}")
+    check("F multi-label host refused", s == 404, s)
+    p.terminate(); p.wait(5)
+    p = spawn({"FLATS_GATE_SITE_PUBLIC_SUFFIX": SUF, "FLATS_GATE_SITE_POLICY": "public", "FLATS_GATE_API_KEYS": KEY})
+    private = [f["slug"] for f in _flats if f.get("visibility") != "public"]
+    if private:
+        s, _ = req(S + "/", host=f"{private[0]}.{SUF}")
+        check("F policy=public hides a private flat", s == 404, s)
+    p.terminate(); p.wait(5)
 
 print("\nRESULT:", "ALL PASS" if not fails else f"{len(fails)} FAILED: {fails}")
 sys.exit(1 if fails else 0)

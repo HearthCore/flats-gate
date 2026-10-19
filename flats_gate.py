@@ -27,6 +27,7 @@ import asyncio
 import hmac
 import logging
 import os
+import re
 import sys
 from urllib.parse import urlsplit
 
@@ -121,7 +122,7 @@ def upstream_host_for_client(request: web.Request) -> str:
     return upstream_host(request)
 
 
-async def forward(request: web.Request, headers: dict, rewrite_body=None, rewrite_location=None):
+async def forward(request: web.Request, headers: dict, rewrite_body=None, rewrite_location=None, rewrite_types=None):
     session: aiohttp.ClientSession = request.app["session"]
     url = UPSTREAM + request.rel_url.raw_path_qs
     data = request.content if request.can_read_body else None
@@ -142,7 +143,8 @@ async def forward(request: web.Request, headers: dict, rewrite_body=None, rewrit
             if lk == "location" and rewrite_location:
                 v = rewrite_location(v)
             out_headers[k] = v
-        if rewrite_body is not None:
+        ctype = up.headers.get("Content-Type", "")
+        if rewrite_body is not None and (rewrite_types is None or any(t in ctype for t in rewrite_types)):
             body = await up.read()
             return web.Response(status=up.status, headers=out_headers, body=rewrite_body(body))
         resp = web.StreamResponse(status=up.status, headers=out_headers)
@@ -153,6 +155,19 @@ async def forward(request: web.Request, headers: dict, rewrite_body=None, rewrit
         return resp
     finally:
         up.release()
+
+
+
+# Flats reports flat links as http://<slug>.localhost:<port>. With a site gate and a
+# public suffix configured, show the public wildcard hostname instead.
+LINK_RE = re.compile(rb"http://([a-z0-9][a-z0-9-]*)\.localhost(?::[0-9]+)?")
+
+
+def rewrite_site_links(body: bytes) -> bytes:
+    if not SITE_SUFFIX:
+        return body
+    tail = b"." + SITE_SUFFIX.encode()
+    return LINK_RE.sub(lambda m: b"https://" + m.group(1) + tail, body)
 
 
 # ---------------------------------------------------------------- console gate
@@ -176,7 +191,9 @@ async def console_handler(request: web.Request):
     headers["Host"] = upstream_host(request)
     # Origin and Referer go through unchanged: Flats checks them against its own
     # declared origins and refuses anything foreign.
-    return await forward(request, headers, rewrite_location=console_location)
+    return await forward(request, headers, rewrite_location=console_location,
+                         rewrite_body=rewrite_site_links if SITE_SUFFIX else None,
+                         rewrite_types=("application/json",))
 
 
 # -------------------------------------------------------------------- mcp gate
@@ -185,6 +202,7 @@ def rewrite_mcp_body(body: bytes) -> bytes:
         body = body.replace((UPSTREAM + "/mcp").encode(), (MCP_PUBLIC_URL + "/mcp").encode())
     if CONSOLE_PUBLIC_URL:
         body = body.replace(UPSTREAM.encode(), CONSOLE_PUBLIC_URL.encode())
+    body = rewrite_site_links(body)
     return body
 
 
