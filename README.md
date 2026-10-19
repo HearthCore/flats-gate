@@ -1,26 +1,35 @@
 # flats-gate
 
-Host/Origin rewrite + MCP API-key shim in front of [Flats](https://github.com/gosuda/flats) (tested against v0.11.1).
+Auth shim in front of [Flats](https://github.com/gosuda/flats) (tested against v0.12.0).
 
-Flats has **no authentication of its own**, its management listener only accepts loopback
-`Host`/`Origin` names, and anything that can reach the listener can approve deploys. A reverse
-proxy with a public hostname therefore gets `403`, and an unmodified passthrough would be unsafe
-anyway. This shim keeps Flats on loopback and exposes two auth boundaries:
+Flats has **no authentication of its own**: anyone who can reach its management listener can
+approve deploys, and the agent surface (`/mcp`) is exposed with it. This shim keeps Flats on
+loopback and puts two auth boundaries in front of it:
 
 | Listener | Serves | Auth | Typical reverse-proxy resource |
 |---|---|---|---|
-| `127.0.0.1:7880` console gate | console, `/console/api`, `/api` (not `/mcp`) | none here — put your proxy's SSO/login in front | `https://flats.example.org` (SSO) |
+| `127.0.0.1:7880` console gate | console, `/console/api`, `/api` (not `/mcp`, not `/metrics`) | none here — put your proxy's SSO/login in front | `https://flats.example.org` (SSO) |
 | `127.0.0.1:7881` mcp gate | `/mcp` only | `Authorization: Bearer <key>` or `X-API-Key: <key>` (keys in `.env`) | e.g. `https://flats-mcp.example.org` (no SSO) |
 
-Console gate: `Host` must be the configured public name, `Origin` (if present) must be the public
-origin; both are rewritten to `127.0.0.1:7878`. Foreign `Host`/`Origin` -> 403, so Flats' CSRF /
-DNS-rebinding protection stays meaningful. MCP gate: loopback URLs inside responses
-(`approval_url`, `console_url`) are rewritten to `FLATS_GATE_CONSOLE_PUBLIC_URL`. Approvals are
-only possible through the console gate, never through MCP.
+The agent surface cannot approve anything (approvals live on `/console/api`, console gate only),
+so a key is enough to expose it without SSO. Upstream tracks built-in authentication in
+[gosuda/flats#139](https://github.com/gosuda/flats/issues/139); when that lands, the key gate can
+be dropped.
 
-This is a **workaround shim**, not a feature: it is the reference implementation for the
-external-console-hostname request in gosuda/flats [#137](https://github.com/gosuda/flats/issues/137). If an upstream release lets the
-operator declare external console hostnames, retire this.
+## What the gate does and does not do
+
+- **Does not rewrite Host/Origin.** Flats v0.12.0 understands external origins
+  (`console.external_origins`): it accepts the declared public Host, refuses foreign Hosts and
+  Origins itself, and builds approval links plus the `llms.txt` documents with the declared
+  scheme. The gate passes the public Host through unchanged.
+- **Refuses foreign Hosts on the console listener** (defence in depth; Flats refuses them too).
+- **Keeps `/mcp` off the console resource**, so the SSO'd resource cannot be used to skip the key.
+- **Blocks `/metrics`.** Flats v0.12.0 added it without a credential: it exposes private flat
+  slugs, CPU and memory to everyone who can reach the console. Set `FLATS_GATE_BLOCK_METRICS=0`
+  to allow it.
+- **Rewrites loopback URLs** in responses to the public console URL as a fallback for hosts that
+  still emit them, and adds an "Access" section to `llms.txt` / `llms-full.txt` when API keys are
+  configured.
 
 ## Setup
 
@@ -37,31 +46,39 @@ and `127.0.0.1:7879` (flat sites). Rotate keys by editing `FLATS_GATE_API_KEYS` 
 one per client) and restarting. Give every client its own key so it can be revoked individually;
 clients that lose the key get 401.
 
+**`FLATS_GATE_CONSOLE_PUBLIC_URL` must match an entry in Flats' `console.external_origins`**
+(Flats v0.12.0+). The gate passes the public Host through unchanged, so Flats itself accepts or
+refuses it. A host the Flats host does not know about gets 403 from Flats, not from the gate.
+Set it offline with the Flats host stopped:
+
+```sh
+flats config set console.external_origins 'https://flats.example.org'
+```
+
 ## Public agent docs (no key)
 
 `FLATS_GATE_PUBLIC_DOCS` (`auto` = on exactly when `FLATS_GATE_CONSOLE_PUBLIC_URL` is set;
 `true`/`false` force) serves exactly five static GET paths from Flats' own binary without a key:
 `/llms.txt`, `/llms-full.txt`, `/docs/agent-guide.md`, `/docs/runtime-api-v1.md`,
-`/docs/content-types.md`. Loopback URLs are rewritten to `FLATS_GATE_CONSOLE_PUBLIC_URL`;
-`/llms*.txt` get an "Access" section (API-key hint) when API keys are configured. There is no
-`/docs` tree — every other `/docs/...` path is 404. In the proxy, add auth-exempt path rules for
-`/llms.txt`, `/llms-full.txt` and `/docs/*` pointing at :7881.
+`/docs/content-types.md`. There is no `/docs` tree — every other `/docs/...` path is 404. In the
+proxy, add auth-exempt path rules for `/llms.txt`, `/llms-full.txt` and `/docs/*`.
 
 ## Modes
 
 - `FLATS_GATE_CONSOLE_PUBLIC_URL` empty = **local-only mode**: only loopback `Host` names accepted,
-  no URL rewriting, no public docs, no access note.
-- Public URL set = **public mode**: the configured host is accepted, URLs rewritten everywhere,
-  docs on by default (`auto`). The "Access" note only appears when API keys are set.
-- Mode tests: `python3 test_modes.py` — spawns throw-away instances on :17880/:17881; mode A checks
-  the live service (public URL taken from `.env` when present).
+  no public docs, no access note.
+- Public URL set = **public mode**: docs on by default (`auto`). The "Access" note only appears
+  when API keys are set.
+- Mode tests: `python3 test_modes.py` — mode A checks the live service, modes B-E spawn
+  throw-away instances on :17880/:17881 and cover local-only, public, docs on/off, key on/off,
+  an origin Flats does not know, and a bad URL.
 
 ## Security notes
 
 - Flats treats "can reach the console" as operator authority. The console gate adds **no**
   authentication: put your proxy's SSO/login in front of it, and keep the management port
   (`7878`) off your network. The mcp gate's API key protects only the agent surface, which cannot
-  approve anything (approvals live on `/console/api`, console gate only).
+  approve anything.
 - Agent stdio (`flats mcp`) on the host and the keyed HTTP endpoint are separate paths and never
   share origins.
 - Single-file Python service meant to be read before use — small, not a hardened edge proxy.

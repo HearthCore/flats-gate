@@ -1,30 +1,23 @@
 #!/usr/bin/env python3
-"""flats-gate: authenticating reverse-proxy shim in front of the Flats management server.
+"""flats-gate: an authenticating reverse-proxy shim in front of the Flats management server.
 
-Why this exists
----------------
-Flats (gosuda/flats) has NO authentication of its own. Its management listener
-(console + /api + /mcp on one port) only accepts loopback Host/Origin names and
-treats "can reach the port" as operator authority (incl. approving deploys).
-Behind a reverse proxy with a public hostname every request is refused (403,
-DNS-rebinding guard), and exposing it as-is would be unsafe anyway.
+Why this exists (Flats v0.12.0+)
+---------------------------------
+Flats has no authentication of its own, and anything that can reach its management
+listener can approve deploys. Since v0.12.0 Flats understands external origins
+(`console.external_origins`): it accepts the declared public Host, refuses foreign
+Hosts and Origins itself, and builds approval links and the llms.txt documents with
+the declared scheme. This shim no longer rewrites Host/Origin - Flats does that.
 
-This shim keeps Flats on loopback and offers two loopback-only listeners that
-Pangolin (newt on this host) can target:
-
-  console gate (default 127.0.0.1:7880)
-      Full operator surface (console, /console/api, /api). NO auth here - it
-      must sit behind Pangolin SSO. Rewrites Host/Origin/Referer from the
-      public name to the loopback name Flats accepts. Foreign Host/Origin are
-      refused (keeps Flats' CSRF / rebinding protection). /mcp is NOT served
-      here so the keyed entrypoint is the only MCP path.
-
-  mcp gate (default 127.0.0.1:7881)
-      ONLY POST/GET/DELETE /mcp (agent surface, cannot approve anything).
-      Requires `Authorization: Bearer <key>` or `X-API-Key: <key>` from
-      FLATS_GATE_API_KEYS (comma separated; empty = no key check, then rely on
-      Pangolin auth). Loopback console URLs in responses (approval_url,
-      console_url) are rewritten to the public console URL.
+What it still does:
+  - console gate: accepts only the configured public host (plus loopback for local
+    calls), keeps /mcp OFF the console resource, and blocks the unauthenticated
+    /metrics endpoint that v0.12.0 added (it exposes private flat slugs, CPU and
+    memory to everyone who can reach the console).
+  - mcp gate: serves /mcp only, and requires `Authorization: Bearer <key>` or
+    `X-API-Key: <key>`. Agents cannot approve anything, so this surface is safe to
+    expose without SSO as long as the key stays secret. Built-in authentication is
+    tracked upstream in gosuda/flats#139.
 
 Config: environment (see .env.example). Stdlib + aiohttp only.
 """
@@ -47,7 +40,7 @@ HOP = {
     "trailers", "transfer-encoding", "upgrade", "content-length", "host",
 }
 STRIP_REQ = HOP | {
-    "accept-encoding",  # keep upstream bodies uncompressed (needed for rewriting)
+    "accept-encoding",  # keep upstream bodies uncompressed
     "x-forwarded-for", "x-forwarded-host", "x-forwarded-proto", "x-forwarded-port",
     "x-real-ip", "forwarded", "x-forwarded-server", "x-forwarded-uri",
     "cf-connecting-ip", "true-client-ip",
@@ -63,23 +56,27 @@ UP_HOSTPORT = urlsplit(UPSTREAM).netloc
 BIND = env("FLATS_GATE_BIND", "127.0.0.1")
 CONSOLE_PORT = int(env("FLATS_GATE_CONSOLE_PORT", "7880"))
 MCP_PORT = int(env("FLATS_GATE_MCP_PORT", "7881"))
-CONSOLE_PUBLIC_URL = env("FLATS_GATE_CONSOLE_PUBLIC_URL", "").rstrip("/")  # empty = no public mode
-MCP_PUBLIC_URL = env("FLATS_GATE_MCP_PUBLIC_URL", "").rstrip("/")  # optional, for mcp_url rewrite
+CONSOLE_PUBLIC_URL = env("FLATS_GATE_CONSOLE_PUBLIC_URL", "").rstrip("/")  # empty = local-only mode
+MCP_PUBLIC_URL = env("FLATS_GATE_MCP_PUBLIC_URL", "").rstrip("/")
 API_KEYS = [k for k in (s.strip() for s in env("FLATS_GATE_API_KEYS").split(",")) if k]
 MIN_KEY_LEN = 24
+BLOCK_METRICS = env("FLATS_GATE_BLOCK_METRICS", "1").lower() in ("1", "true", "yes")
 
-_pub = urlsplit(CONSOLE_PUBLIC_URL)
-if CONSOLE_PUBLIC_URL and (_pub.scheme not in ("http", "https") or not _pub.netloc):
-    sys.exit(f"flats-gate: FLATS_GATE_CONSOLE_PUBLIC_URL must be http(s)://host[:port], got {CONSOLE_PUBLIC_URL!r}")
-# Host names the console gate accepts. With a public URL set, Pangolin's public Host is added.
+if CONSOLE_PUBLIC_URL:
+    _pub = urlsplit(CONSOLE_PUBLIC_URL)
+    if _pub.scheme not in ("http", "https") or not _pub.netloc:
+        sys.exit(f"flats-gate: FLATS_GATE_CONSOLE_PUBLIC_URL must be http(s)://host[:port], got {CONSOLE_PUBLIC_URL!r}")
+
+# Host names the console gate accepts: the public name (Flats has it in
+# console.external_origins) plus loopback names for local calls.
 CONSOLE_HOSTS = {h.lower() for h in (
-    ([_pub.netloc] if CONSOLE_PUBLIC_URL else []) + [f"127.0.0.1:{CONSOLE_PORT}", f"localhost:{CONSOLE_PORT}"]
+    ([urlsplit(CONSOLE_PUBLIC_URL).netloc] if CONSOLE_PUBLIC_URL else [])
+    + [f"127.0.0.1:{CONSOLE_PORT}", f"localhost:{CONSOLE_PORT}", "127.0.0.1", "localhost", "[::1]"]
     + [s.strip() for s in env("FLATS_GATE_EXTRA_HOSTS").split(",") if s.strip()]
 )}
-CONSOLE_ORIGINS = set()
-for h in CONSOLE_HOSTS:
-    CONSOLE_ORIGINS.add(f"https://{h}")
-    CONSOLE_ORIGINS.add(f"http://{h}")
+# The Host we send upstream: the public authority (no default port) when the
+# request came in on it, otherwise Flats' own loopback authority.
+UPSTREAM_PUBLIC_HOST = urlsplit(CONSOLE_PUBLIC_URL).netloc if CONSOLE_PUBLIC_URL else ""
 
 
 def clean_headers(src, drop=STRIP_REQ):
@@ -96,9 +93,29 @@ def key_ok(request: web.Request) -> bool:
     if not cand:
         return False
     ok = False
-    for k in API_KEYS:  # no early exit: constant-ish time over all keys
+    for k in API_KEYS:  # no early exit: compare against every key
         ok |= hmac.compare_digest(cand.encode(), k.encode())
     return ok
+
+
+def upstream_host(request: web.Request) -> str:
+    """Host to send upstream.
+
+    The public authority goes through unchanged so Flats links and discovery
+    documents use the public URL (v0.12.0 external origins). Local callers are
+    mapped to Flats' loopback authority, which Flats always accepts.
+    """
+    host = request.headers.get("Host", "").lower()
+    if UPSTREAM_PUBLIC_HOST and host.split(":")[0] == UPSTREAM_PUBLIC_HOST.split(":")[0]:
+        return UPSTREAM_PUBLIC_HOST
+    return UP_HOSTPORT
+
+
+def upstream_host_for_client(request: web.Request) -> str:
+    """Host to send upstream when the request came from a client (not a browser
+    on the console page): the public authority when the client used it, so
+    Flats builds public links on its own."""
+    return upstream_host(request)
 
 
 async def forward(request: web.Request, headers: dict, rewrite_body=None, rewrite_location=None):
@@ -124,8 +141,7 @@ async def forward(request: web.Request, headers: dict, rewrite_body=None, rewrit
             out_headers[k] = v
         if rewrite_body is not None:
             body = await up.read()
-            body = rewrite_body(body)
-            return web.Response(status=up.status, headers=out_headers, body=body)
+            return web.Response(status=up.status, headers=out_headers, body=rewrite_body(body))
         resp = web.StreamResponse(status=up.status, headers=out_headers)
         await resp.prepare(request)
         async for chunk in up.content.iter_any():
@@ -148,25 +164,15 @@ async def console_handler(request: web.Request):
     if host not in CONSOLE_HOSTS:
         return web.json_response({"error": f"host {host!r} not served by this gate"}, status=403)
     if request.path == "/mcp" or request.path.startswith("/mcp/"):
+        # the console resource sits behind SSO and must not expose the agent
+        # surface; /mcp is served on the keyed MCP resource only.
         return web.json_response({"error": "MCP is served on the keyed MCP endpoint only"}, status=404)
+    if BLOCK_METRICS and request.path == "/metrics":
+        return web.json_response({"error": "metrics are not exposed"}, status=404)
     headers = clean_headers(request.headers)
-    headers["Host"] = UP_HOSTPORT
-    if CONSOLE_PUBLIC_URL and request.path in DOC_PATHS and request.method in ("GET", "HEAD"):
-        # same agent docs as on the mcp gate: reached via the console target too, so rewrite here as well
-        return await forward(request, {k: v for k, v in headers.items() if k.lower() in ("accept", "user-agent", "host")},
-                             rewrite_body=rewrite_docs_body(request.path))
-    origin = request.headers.get("Origin")
-    if origin is not None:
-        if origin.lower() not in CONSOLE_ORIGINS:
-            return web.json_response({"error": "cross-origin request refused"}, status=403)
-        headers["Origin"] = UPSTREAM
-    ref = request.headers.get("Referer")
-    if ref:
-        rs = urlsplit(ref)
-        if f"{rs.scheme}://{rs.netloc}".lower() in CONSOLE_ORIGINS:
-            headers["Referer"] = UPSTREAM + (rs.path or "/") + (f"?{rs.query}" if rs.query else "")
-        else:
-            headers.pop("Referer", None)
+    headers["Host"] = upstream_host(request)
+    # Origin and Referer go through unchanged: Flats checks them against its own
+    # declared origins and refuses anything foreign.
     return await forward(request, headers, rewrite_location=console_location)
 
 
@@ -183,7 +189,7 @@ def rewrite_mcp_body(body: bytes) -> bytes:
 # (mcpx.LLMsPaths). Exact paths only - there is no /docs tree.
 DOC_PATHS = {"/llms.txt", "/llms-full.txt", "/docs/agent-guide.md",
              "/docs/runtime-api-v1.md", "/docs/content-types.md"}
-# auto (default): on exactly when a public URL is configured; true/false force it.
+# auto (default): on exactly when a public URL is configured; true/false force.
 _docs = env("FLATS_GATE_PUBLIC_DOCS", "auto").lower()
 PUBLIC_DOCS = bool(CONSOLE_PUBLIC_URL) if _docs == "auto" else _docs in ("1", "true", "yes")
 
@@ -210,12 +216,14 @@ def rewrite_docs_body(path: str):
 
 
 async def mcp_handler(request: web.Request):
+    if BLOCK_METRICS and request.path == "/metrics":
+        return web.json_response({"error": "metrics are not exposed"}, status=404)
     if PUBLIC_DOCS and request.path in DOC_PATHS:
         if request.method not in ("GET", "HEAD"):
             return web.json_response({"error": "method not allowed"}, status=405,
                                      headers={"Allow": "GET, HEAD"})
         headers = {k: v for k, v in clean_headers(request.headers).items()
-                   if k.lower() in ("accept", "user-agent")} | {"Host": UP_HOSTPORT}
+                   if k.lower() in ("accept", "user-agent")} | {"Host": upstream_host_for_client(request)}
         return await forward(request, headers, rewrite_body=rewrite_docs_body(request.path))
     if request.path != "/mcp":
         return web.json_response({"error": "not found"}, status=404)
@@ -223,7 +231,7 @@ async def mcp_handler(request: web.Request):
         log.warning("auth failure from %s", request.headers.get("X-Real-IP") or request.remote)
         return web.json_response({"error": "unauthorized"}, status=401,
                                  headers={"WWW-Authenticate": 'Bearer realm="flats-mcp"'})
-    headers = clean_headers(request.headers) | {"Host": UP_HOSTPORT}
+    headers = clean_headers(request.headers) | {"Host": upstream_host_for_client(request)}
     for h in ("Origin", "Referer", "Authorization", "X-API-Key"):
         headers.pop(h, None)
         for k in [k for k in headers if k.lower() == h.lower()]:
@@ -265,8 +273,9 @@ async def main():
         await r.setup()
         await web.TCPSite(r, BIND, port).start()
         runners.append(r)
-    log.info("console gate %s:%s (public=%s) | mcp gate %s:%s (keys=%d, public_docs=%s) -> %s",
-             BIND, CONSOLE_PORT, CONSOLE_PUBLIC_URL or "off", BIND, MCP_PORT, len(API_KEYS), PUBLIC_DOCS, UPSTREAM)
+    log.info("console gate %s:%s (public=%s, metrics_blocked=%s) | mcp gate %s:%s (keys=%d, public_docs=%s) -> %s",
+             BIND, CONSOLE_PORT, CONSOLE_PUBLIC_URL or "off", BLOCK_METRICS,
+             BIND, MCP_PORT, len(API_KEYS), PUBLIC_DOCS, UPSTREAM)
     await asyncio.Event().wait()
 
 
